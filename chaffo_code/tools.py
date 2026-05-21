@@ -34,6 +34,7 @@ class ToolRegistry:
     - lire un fichier ;
     - ecrire un fichier ;
     - remplacer du texte dans un fichier ;
+    - remplacer une plage de lignes dans un fichier ;
     - lancer une commande.
 
     Chaque chemin est limite au workspace choisi par l'utilisateur. Les actions
@@ -186,6 +187,62 @@ class ToolRegistry:
         file_path.write_text(text.replace(old, new), encoding="utf-8")
         return f"Remplacement termine dans {self._relative(file_path)} ({count} occurrence(s))."
 
+    def replace_lines(
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        new_content: str,
+    ) -> str:
+        """Remplace une plage de lignes 1-indexee dans un fichier.
+
+        Cet outil est plus simple pour un coding agent que `replace_in_file`,
+        car il peut s'appuyer directement sur les numeros retournes par
+        `read_file`.
+        """
+
+        file_path = self._safe_path(path)
+        if not file_path.exists() or not file_path.is_file():
+            return f"Fichier introuvable: {path}"
+
+        if start_line < 1 or end_line < start_line:
+            return "Erreur: start_line doit etre >= 1 et end_line doit etre >= start_line."
+
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        had_final_newline = text.endswith("\n")
+        lines = text.splitlines()
+
+        if start_line > len(lines):
+            return f"Erreur: le fichier a seulement {len(lines)} lignes."
+        if end_line > len(lines):
+            return f"Erreur: end_line depasse la longueur du fichier ({len(lines)} lignes)."
+
+        replacement_lines = new_content.splitlines()
+        new_lines = lines[: start_line - 1] + replacement_lines + lines[end_line:]
+
+        action = (
+            f"remplacer les lignes {start_line}-{end_line} "
+            f"dans {self._relative(file_path)}"
+        )
+        if not self._confirm(action, scope="files:write"):
+            return "Action annulee par l'utilisateur."
+
+        output = "\n".join(new_lines)
+        if had_final_newline:
+            output += "\n"
+        file_path.write_text(output, encoding="utf-8")
+
+        preview_start = max(start_line - 3, 1)
+        preview_lines = self.read_file(
+            path,
+            start_line=preview_start,
+            max_lines=len(replacement_lines) + 6,
+        )
+        return (
+            f"Lignes {start_line}-{end_line} remplacees dans {self._relative(file_path)}.\n"
+            f"Apercu:\n{preview_lines}"
+        )
+
     def run_command(self, command: str, timeout_seconds: int = 30) -> str:
         """Lance une commande dans le workspace apres confirmation."""
 
@@ -287,7 +344,11 @@ class ToolRegistry:
                     "type": "function",
                     "function": {
                         "name": "replace_in_file",
-                        "description": "Remplace un texte exact par un autre dans un fichier.",
+                        "description": (
+                            "Remplace un texte exact par un autre dans un fichier. "
+                            "A utiliser seulement si le texte exact est connu. "
+                            "Pour modifier du code par numeros de lignes, preferer replace_lines."
+                        ),
                         "parameters": {
                             "type": "object",
                             "required": ["path", "old", "new"],
@@ -300,6 +361,41 @@ class ToolRegistry:
                     },
                 },
                 handler=self.replace_in_file,
+            ),
+            "replace_lines": Tool(
+                schema={
+                    "type": "function",
+                    "function": {
+                        "name": "replace_lines",
+                        "description": (
+                            "Remplace une plage de lignes dans un fichier. "
+                            "Utilise cet outil pour les corrections de code apres read_file."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "required": ["path", "start_line", "end_line", "new_content"],
+                            "properties": {
+                                "path": {"type": "string", "description": "Chemin du fichier."},
+                                "start_line": {
+                                    "type": "integer",
+                                    "description": "Premiere ligne a remplacer, 1-indexee.",
+                                },
+                                "end_line": {
+                                    "type": "integer",
+                                    "description": "Derniere ligne a remplacer, incluse.",
+                                },
+                                "new_content": {
+                                    "type": "string",
+                                    "description": (
+                                        "Nouveau contenu sans numeros de lignes. "
+                                        "Peut contenir plusieurs lignes."
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+                handler=self.replace_lines,
             ),
             "run_command": Tool(
                 schema={

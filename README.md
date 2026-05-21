@@ -106,6 +106,14 @@ Dans ce cas, l'agent travaillera dans :
 workspaces/demo/
 ```
 
+Si tu colles une erreur qui contient un chemin comme :
+
+```text
+C:\...\chaffo-code\workspaces\pong\pong.py
+```
+
+Chaffo code detecte automatiquement le workspace `pong` et utilise les chemins relatifs a ce dossier.
+
 ## Utilisation en une commande
 
 ```powershell
@@ -317,6 +325,7 @@ Cette approche suit le pattern "coding agent / harness" : le harness controle la
 | `read_file` | Lit un fichier avec numeros de ligne. |
 | `write_file` | Cree ou remplace un fichier. |
 | `replace_in_file` | Remplace un texte exact dans un fichier. |
+| `replace_lines` | Remplace une plage de lignes, plus fiable pour corriger du code. |
 | `run_command` | Lance une commande dans le workspace. |
 
 ## Securite

@@ -18,11 +18,18 @@ Ta mission:
 
 Regles importantes:
 - Lis les fichiers avant de les modifier.
+- Tous les chemins passes aux outils sont relatifs au workspace actif.
+- Si un traceback mentionne un fichier dans le workspace actif, utilise son chemin relatif.
 - Prefere des modifications simples et localisees.
 - N'invente pas le contenu d'un fichier: utilise read_file si tu dois t'appuyer dessus.
+- Pour modifier du code, prefere replace_lines apres avoir lu les numeros de lignes.
+- N'inclus jamais les numeros de lignes de read_file dans le contenu ecrit.
 - Les actions d'ecriture et d'execution peuvent demander confirmation a l'utilisateur.
 - Suis le plan fourni par le harness, tache par tache.
+- Si un outil echoue, ne dis pas que la tache est terminee: corrige ton appel ou essaie une autre approche.
 - Si une commande echoue, lis l'erreur et propose ou applique une correction.
+- Ignore les UserWarning non bloquants si un traceback fatal suit.
+- Pour UnboundLocalError sur une variable locale, cherche une assignation dans la meme fonction avant de conclure.
 - Quand la tache est terminee, reponds sans appeler d'outil supplementaire.
 """
 
@@ -73,8 +80,12 @@ class ChaffoAgent:
             self.console.task_start(index, len(tasks), task)
             task_prompt = (
                 f"Execute uniquement la tache {index}/{len(tasks)}:\n{task}\n\n"
-                "Utilise les outils si necessaire. Quand cette tache est terminee, "
-                "donne un court bilan et n'appelle plus d'outil."
+                f"Workspace actif: {self.config.workspace}\n"
+                "Tous les chemins d'outils doivent etre relatifs a ce workspace.\n"
+                "Utilise les outils si necessaire. Si un outil renvoie Erreur, "
+                "Fichier introuvable, Texte introuvable, Action annulee ou code_sortie non nul, "
+                "ne conclus pas au succes: corrige ton approche ou explique le blocage.\n"
+                "Quand cette tache est vraiment terminee, donne un court bilan et n'appelle plus d'outil."
             )
             note = self._run_tool_loop(task_prompt)
             task_notes.append(note)
@@ -92,9 +103,13 @@ class ChaffoAgent:
             "Construis un plan d'execution pour un coding agent CLI.\n"
             "Retourne uniquement une liste numerotee de 1 a 5 taches courtes.\n"
             "Chaque tache doit etre concrete et actionnable.\n\n"
+            f"Workspace actif: {self.config.workspace}\n"
+            "Tous les chemins d'outils sont relatifs a ce workspace.\n\n"
             "Regles de planification:\n"
             "- Pour une demande simple, fais une seule tache.\n"
             "- Pour une modification de code, prevois inspection, modification, verification.\n"
+            "- Pour une traceback Python, lis le fichier mentionne, inspecte autour de la ligne, corrige, puis teste.\n"
+            "- Ignore les UserWarning non bloquants si un traceback fatal suit.\n"
             "- N'ajoute pas d'inspection, de modification ou de test si la demande ne l'exige pas.\n"
             "- Ne cree pas de tache vague comme 'finaliser' si elle n'apporte rien.\n\n"
             f"Demande utilisateur:\n{user_prompt}"
@@ -150,7 +165,7 @@ class ChaffoAgent:
             if cleaned:
                 tasks.append(cleaned)
 
-        return tasks[:6]
+        return tasks[:5]
 
     def _remove_number_prefix(self, line: str) -> str:
         parts = line.split(maxsplit=1)
@@ -170,6 +185,8 @@ class ChaffoAgent:
         """Execute une tache avec la boucle modele -> outils -> modele."""
 
         self.messages.append({"role": "user", "content": task_prompt})
+        last_tool_result = ""
+        failure_reminder_sent = False
 
         for step in range(1, self.config.max_steps + 1):
             if self.config.verbose:
@@ -188,14 +205,38 @@ class ChaffoAgent:
             self.messages.append(assistant_message)
 
             if not tool_calls:
-                return str(assistant_message.get("content", "")).strip()
+                content = str(assistant_message.get("content", "")).strip()
+                if (
+                    last_tool_result
+                    and self._tool_result_failed(last_tool_result)
+                    and not failure_reminder_sent
+                ):
+                    failure_reminder_sent = True
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Le dernier resultat d'outil indique un echec:\n"
+                                f"{last_tool_result}\n\n"
+                                "Ne conclus pas que la tache est reussie. "
+                                "Corrige l'appel d'outil, essaie une autre approche, "
+                                "ou explique clairement pourquoi c'est bloque."
+                            ),
+                        }
+                    )
+                    continue
+
+                return content
 
             for call in tool_calls:
                 tool_name, arguments = self._parse_tool_call(call)
                 self.console.tool_call(tool_name, arguments)
 
                 result = self.tools.execute(tool_name, arguments)
-                if self.config.verbose:
+                last_tool_result = result
+                failure_reminder_sent = False
+
+                if self.config.verbose or self._tool_result_failed(result):
                     self.console.tool_result(result)
 
                 self.messages.append(
@@ -210,6 +251,26 @@ class ChaffoAgent:
             "J'ai atteint la limite d'etapes sans terminer. "
             "Relance avec --max-steps plus grand si necessaire."
         )
+
+    def _tool_result_failed(self, result: str) -> bool:
+        """Detecte les echecs d'outils les plus courants."""
+
+        lowered = result.lower()
+        failure_markers = (
+            "erreur",
+            "fichier introuvable",
+            "texte a remplacer introuvable",
+            "action annulee",
+            "commande bloquee",
+        )
+        if any(marker in lowered for marker in failure_markers):
+            return True
+
+        for line in result.splitlines():
+            if line.startswith("code_sortie:"):
+                return line.strip() != "code_sortie: 0"
+
+        return False
 
     def _summarize(
         self,
@@ -245,10 +306,18 @@ class ChaffoAgent:
 
         self.config.workspace = workspace
         self.tools.set_workspace(workspace)
+        self.add_system_note(
+            f"Le workspace actif est maintenant: {workspace}. "
+            "Tous les chemins d'outils sont relatifs a ce dossier."
+        )
+
+    def add_system_note(self, content: str) -> None:
+        """Ajoute une note de contexte invisible dans le fil agentique."""
+
         self.messages.append(
             {
                 "role": "system",
-                "content": f"Le workspace actif est maintenant: {workspace}",
+                "content": content,
             }
         )
 

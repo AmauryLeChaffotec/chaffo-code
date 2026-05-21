@@ -60,6 +60,7 @@ def main() -> None:
 
     prompt = build_prompt(args)
     if prompt:
+        prompt = apply_prompt_workspace_context(prompt, agent, config, console)
         answer = agent.ask(prompt)
         console.final_answer(answer)
         return
@@ -287,6 +288,7 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
         if not prompt:
             continue
 
+        prompt = apply_prompt_workspace_context(prompt, agent, config, console)
         answer = agent.ask(prompt)
         console.final_answer(answer)
 
@@ -393,6 +395,105 @@ def workspace_label(workspace: Path) -> str:
 
     label = str(relative)
     return "." if label == "." else label
+
+
+def apply_prompt_workspace_context(
+    prompt: str,
+    agent: ChaffoAgent,
+    config: AgentConfig,
+    console: Console,
+) -> str:
+    """Detecte un workspace dans un traceback et l'active avant l'appel LLM."""
+
+    detected_workspace = detect_workspace_from_prompt(prompt)
+    if not detected_workspace:
+        return prompt
+
+    if detected_workspace.resolve() != config.workspace.resolve():
+        config.workspace = detected_workspace
+        agent.set_workspace(detected_workspace)
+        console.info(f"Workspace detecte depuis la demande: {detected_workspace}")
+
+    label = workspace_label(detected_workspace)
+    note = (
+        f"- Workspace actif detecte: {detected_workspace}\n"
+        f"- Nom court: {label}\n"
+        "- Tous les chemins d'outils sont relatifs a ce dossier.\n"
+        "- Si le traceback mentionne un fichier dans ce dossier, utilise le chemin relatif "
+        "depuis ce workspace.\n"
+    )
+    agent.add_system_note(f"Note du harness:\n{note}")
+    return prompt
+
+
+def detect_workspace_from_prompt(prompt: str) -> Path | None:
+    """Trouve un sous-workspace mentionne dans un prompt ou traceback."""
+
+    root = WORKSPACES_ROOT.resolve()
+    root_text = str(root).replace("/", "\\")
+    prompt_text = prompt.replace("/", "\\")
+    lower_prompt = prompt_text.lower()
+    lower_root = root_text.lower()
+
+    start = 0
+    while True:
+        index = lower_prompt.find(lower_root, start)
+        if index == -1:
+            return None
+
+        remainder = prompt_text[index + len(root_text) :]
+        relative_text = extract_relative_workspace_text(remainder)
+        candidate = workspace_from_relative_text(root, relative_text)
+
+        if candidate and candidate.resolve() == root:
+            return candidate
+        if candidate and root in candidate.resolve().parents:
+            return candidate
+
+        start = index + len(root_text)
+
+
+def extract_relative_workspace_text(remainder: str) -> str:
+    """Extrait la partie de chemin apres `workspaces`."""
+
+    remainder = remainder.lstrip("\\/")
+    chars: list[str] = []
+    delimiters = {'"', "'", ">", "\r", "\n", ","}
+
+    for char in remainder:
+        if char in delimiters:
+            break
+        chars.append(char)
+
+    return "".join(chars).strip().rstrip("\\/")
+
+
+def workspace_from_relative_text(root: Path, relative_text: str) -> Path | None:
+    """Convertit une portion de chemin en dossier workspace."""
+
+    if not relative_text:
+        return root
+
+    parts = [part for part in relative_text.replace("/", "\\").split("\\") if part]
+    if not parts:
+        return root
+
+    candidate = root.joinpath(*parts)
+    if candidate.suffix:
+        candidate = candidate.parent
+    elif candidate.exists() and candidate.is_file():
+        candidate = candidate.parent
+
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return None
+
+    if resolved != root and root not in resolved.parents:
+        return None
+
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
 def read_multiline_prompt() -> str:
