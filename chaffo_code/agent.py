@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from typing import Any
 
 from .config import AgentConfig
@@ -78,16 +79,18 @@ class ChaffoAgent:
         task_notes: list[str] = []
         for index, task in enumerate(tasks, start=1):
             self.console.task_start(index, len(tasks), task)
+            required_tools = self._required_tools_for_task(task)
             task_prompt = (
                 f"Execute uniquement la tache {index}/{len(tasks)}:\n{task}\n\n"
                 f"Workspace actif: {self.config.workspace}\n"
                 "Tous les chemins d'outils doivent etre relatifs a ce workspace.\n"
+                f"Outils requis pour cette tache: {', '.join(required_tools) or 'aucun'}.\n"
                 "Utilise les outils si necessaire. Si un outil renvoie Erreur, "
                 "Fichier introuvable, Texte introuvable, Action annulee ou code_sortie non nul, "
                 "ne conclus pas au succes: corrige ton approche ou explique le blocage.\n"
                 "Quand cette tache est vraiment terminee, donne un court bilan et n'appelle plus d'outil."
             )
-            note = self._run_tool_loop(task_prompt)
+            note = self._run_tool_loop(task_prompt, required_tools=required_tools)
             task_notes.append(note)
             self.console.task_done(index, note)
 
@@ -181,12 +184,68 @@ class ChaffoAgent:
 
         return ""
 
-    def _run_tool_loop(self, task_prompt: str) -> str:
+    def _required_tools_for_task(self, task: str) -> list[str]:
+        """Retourne les outils que le modele doit appeler pour une tache."""
+
+        lowered = self._normalize_text(task)
+
+        read_markers = (
+            "lire",
+            "inspecter",
+            "analyser",
+            "comprendre",
+            "identifier",
+            "trouver",
+            "chercher",
+            "contexte",
+        )
+        write_markers = (
+            "modifier",
+            "corriger",
+            "ajouter",
+            "initialiser",
+            "remplacer",
+            "supprimer",
+            "ecrire",
+            "creer",
+        )
+        run_markers = (
+            "executer",
+            "lancer",
+            "tester",
+            "verifier",
+            "confirmer",
+        )
+
+        required: list[str] = []
+        if any(marker in lowered for marker in read_markers):
+            required.extend(["read_file", "list_files"])
+        if any(marker in lowered for marker in write_markers):
+            required.extend(["replace_lines", "replace_in_file", "write_file"])
+        if any(marker in lowered for marker in run_markers):
+            required.append("run_command")
+
+        return list(dict.fromkeys(required))
+
+    def _normalize_text(self, value: str) -> str:
+        """Minuscule + suppression des accents pour matcher simplement."""
+
+        normalized = unicodedata.normalize("NFKD", value.lower())
+        return normalized.encode("ascii", "ignore").decode("ascii")
+
+    def _run_tool_loop(
+        self,
+        task_prompt: str,
+        required_tools: list[str] | None = None,
+    ) -> str:
         """Execute une tache avec la boucle modele -> outils -> modele."""
 
+        required_tools = required_tools or []
         self.messages.append({"role": "user", "content": task_prompt})
         last_tool_result = ""
         failure_reminder_sent = False
+        tool_requirement_reminders = 0
+        used_tools: list[str] = []
 
         for step in range(1, self.config.max_steps + 1):
             if self.config.verbose:
@@ -206,6 +265,27 @@ class ChaffoAgent:
 
             if not tool_calls:
                 content = str(assistant_message.get("content", "")).strip()
+                if required_tools and not self._used_required_tool(used_tools, required_tools):
+                    if tool_requirement_reminders < 2:
+                        tool_requirement_reminders += 1
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Tu ne peux pas terminer cette tache sans appeler un outil requis.\n"
+                                    f"Outils requis: {', '.join(required_tools)}\n"
+                                    f"Outils deja utilises: {', '.join(used_tools) or 'aucun'}\n"
+                                    "Appelle maintenant un outil requis avec les bons arguments."
+                                ),
+                            }
+                        )
+                        continue
+
+                    return (
+                        "Bloque: le modele a tente de terminer la tache sans appeler "
+                        f"un outil requis ({', '.join(required_tools)})."
+                    )
+
                 if (
                     last_tool_result
                     and self._tool_result_failed(last_tool_result)
@@ -226,10 +306,14 @@ class ChaffoAgent:
                     )
                     continue
 
+                if used_tools:
+                    return f"{content}\n\nOutils utilises: {', '.join(used_tools)}"
+
                 return content
 
             for call in tool_calls:
                 tool_name, arguments = self._parse_tool_call(call)
+                used_tools.append(tool_name)
                 self.console.tool_call(tool_name, arguments)
 
                 result = self.tools.execute(tool_name, arguments)
@@ -251,6 +335,15 @@ class ChaffoAgent:
             "J'ai atteint la limite d'etapes sans terminer. "
             "Relance avec --max-steps plus grand si necessaire."
         )
+
+    def _used_required_tool(
+        self,
+        used_tools: list[str],
+        required_tools: list[str],
+    ) -> bool:
+        """Verifie qu'au moins un outil requis a vraiment ete appele."""
+
+        return any(tool in required_tools for tool in used_tools)
 
     def _tool_result_failed(self, result: str) -> bool:
         """Detecte les echecs d'outils les plus courants."""

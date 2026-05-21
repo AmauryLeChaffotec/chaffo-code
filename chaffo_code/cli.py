@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import shlex
 import sys
@@ -422,8 +423,41 @@ def apply_prompt_workspace_context(
         "- Si le traceback mentionne un fichier dans ce dossier, utilise le chemin relatif "
         "depuis ce workspace.\n"
     )
+    locations = extract_traceback_locations(prompt, detected_workspace)
+    if locations:
+        note += "- Fichiers detectes dans le traceback:\n"
+        for relative_path, line_number in locations:
+            start_line = max(line_number - 20, 1)
+            note += (
+                f"  - {relative_path}, ligne {line_number}. "
+                f"Commence par read_file(path='{relative_path}', "
+                f"start_line={start_line}, max_lines=60).\n"
+            )
+
     agent.add_system_note(f"Note du harness:\n{note}")
     return prompt
+
+
+def extract_traceback_locations(prompt: str, workspace: Path) -> list[tuple[str, int]]:
+    """Extrait les fichiers et lignes Python mentionnes dans un traceback."""
+
+    locations: list[tuple[str, int]] = []
+    pattern = re.compile(r'File "([^"]+)", line (\d+)')
+
+    for match in pattern.finditer(prompt):
+        raw_path = match.group(1)
+        line_number = int(match.group(2))
+        path = Path(raw_path)
+
+        try:
+            resolved = path.resolve()
+            relative = resolved.relative_to(workspace.resolve())
+        except (OSError, ValueError):
+            continue
+
+        locations.append((str(relative), line_number))
+
+    return locations
 
 
 def detect_workspace_from_prompt(prompt: str) -> Path | None:

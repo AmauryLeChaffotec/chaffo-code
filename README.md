@@ -113,6 +113,7 @@ C:\...\chaffo-code\workspaces\pong\pong.py
 ```
 
 Chaffo code detecte automatiquement le workspace `pong` et utilise les chemins relatifs a ce dossier.
+Il extrait aussi les fichiers et lignes du traceback pour guider l'agent vers le bon `read_file`.
 
 ## Utilisation en une commande
 
@@ -327,6 +328,12 @@ Cette approche suit le pattern "coding agent / harness" : le harness controle la
 | `replace_in_file` | Remplace un texte exact dans un fichier. |
 | `replace_lines` | Remplace une plage de lignes, plus fiable pour corriger du code. |
 | `run_command` | Lance une commande dans le workspace. |
+
+Pour eviter les faux succes, le harness impose certains outils selon la tache :
+
+- une tache de lecture doit appeler `read_file` ou `list_files` ;
+- une tache de modification doit appeler `replace_lines`, `replace_in_file` ou `write_file` ;
+- une tache de test ou execution doit appeler `run_command`.
 
 ## Securite
 
