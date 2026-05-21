@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import unicodedata
+from pathlib import Path
 from typing import Any
 
 from .config import AgentConfig
@@ -24,6 +26,7 @@ Regles importantes:
 - Prefere des modifications simples et localisees.
 - N'invente pas le contenu d'un fichier: utilise read_file si tu dois t'appuyer dessus.
 - Pour modifier du code, prefere replace_lines apres avoir lu les numeros de lignes.
+- Pour UnboundLocalError, prefere patch_python_unboundlocal quand le fichier, la fonction et la variable sont connus.
 - N'inclus jamais les numeros de lignes de read_file dans le contenu ecrit.
 - Les actions d'ecriture et d'execution peuvent demander confirmation a l'utilisateur.
 - Suis le plan fourni par le harness, tache par tache.
@@ -62,6 +65,10 @@ class ChaffoAgent:
         """Traite une demande utilisateur et retourne la reponse finale."""
 
         self.console.user_prompt(user_prompt)
+        unboundlocal_repair = self._detect_unboundlocal_repair(user_prompt)
+        if unboundlocal_repair:
+            return self._repair_unboundlocal(unboundlocal_repair)
+
         tasks = self._build_plan(user_prompt)
         self.console.plan(tasks)
 
@@ -80,27 +87,175 @@ class ChaffoAgent:
         for index, task in enumerate(tasks, start=1):
             self.console.task_start(index, len(tasks), task)
             required_tools = self._required_tools_for_task(task)
+            allowed_tools = self._allowed_tools_for_task(task)
             task_prompt = (
                 f"Execute uniquement la tache {index}/{len(tasks)}:\n{task}\n\n"
                 f"Workspace actif: {self.config.workspace}\n"
                 "Tous les chemins d'outils doivent etre relatifs a ce workspace.\n"
                 f"Outils requis pour cette tache: {', '.join(required_tools) or 'aucun'}.\n"
+                f"Outils autorises pour cette tache: {', '.join(allowed_tools)}.\n"
+                "Si un outil utile n'est pas autorise, termine la tache en expliquant le besoin.\n"
                 "Utilise les outils si necessaire. Si un outil renvoie Erreur, "
                 "Fichier introuvable, Texte introuvable, Action annulee ou code_sortie non nul, "
                 "ne conclus pas au succes: corrige ton approche ou explique le blocage.\n"
                 "Quand cette tache est vraiment terminee, donne un court bilan et n'appelle plus d'outil."
             )
-            note = self._run_tool_loop(task_prompt, required_tools=required_tools)
+            note = self._run_tool_loop(
+                task_prompt,
+                required_tools=required_tools,
+                allowed_tools=allowed_tools,
+            )
             task_notes.append(note)
             self.console.task_done(index, note)
 
         return self._summarize(user_prompt, tasks, task_notes)
+
+    def _detect_unboundlocal_repair(self, user_prompt: str) -> dict[str, Any] | None:
+        """Detecte un UnboundLocalError Python assez precis pour un patch direct."""
+
+        variable_match = re.search(
+            r"UnboundLocalError: cannot access local variable '([^']+)'",
+            user_prompt,
+        )
+        if not variable_match:
+            return None
+
+        variable_name = variable_match.group(1)
+        frame_pattern = re.compile(r'File "([^"]+)", line (\d+), in ([A-Za-z_][A-Za-z0-9_]*)')
+        frames = list(frame_pattern.finditer(user_prompt))
+
+        if frames:
+            frame = frames[-1]
+            raw_path = frame.group(1)
+            line_number = int(frame.group(2))
+            function_name = frame.group(3)
+        else:
+            simple_frame = re.search(
+                r"File\s+([^\s]+\.py)\s+line\s+(\d+)\s+in\s+([A-Za-z_][A-Za-z0-9_]*)",
+                user_prompt,
+            )
+            if not simple_frame:
+                return None
+            raw_path = simple_frame.group(1)
+            line_number = int(simple_frame.group(2))
+            function_name = simple_frame.group(3)
+
+        relative_path = self._tool_relative_path(raw_path)
+        if not relative_path:
+            return None
+
+        return {
+            "path": relative_path,
+            "line_number": line_number,
+            "function_name": function_name,
+            "variable_name": variable_name,
+        }
+
+    def _tool_relative_path(self, raw_path: str) -> str | None:
+        """Convertit un chemin de traceback en chemin utilisable par les outils."""
+
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            return raw_path.replace("\\", "/")
+
+        try:
+            return str(candidate.resolve().relative_to(self.config.workspace.resolve()))
+        except (OSError, ValueError):
+            return None
+
+    def _repair_unboundlocal(self, repair: dict[str, Any]) -> str:
+        """Recette deterministe pour corriger un UnboundLocalError courant."""
+
+        path = str(repair["path"])
+        line_number = int(repair["line_number"])
+        function_name = str(repair["function_name"])
+        variable_name = str(repair["variable_name"])
+        read_start = max(line_number - 20, 1)
+
+        tasks = [
+            f"Lire {path} autour de la ligne {line_number}.",
+            (
+                "Appliquer patch_python_unboundlocal "
+                f"sur {function_name} pour {variable_name}."
+            ),
+            f"Relire {path} pour verifier la declaration global.",
+            f"Verifier la syntaxe avec python -m py_compile {path}.",
+        ]
+        self.console.plan(tasks)
+
+        self.console.task_start(1, len(tasks), tasks[0])
+        read_result = self._run_direct_tool(
+            "read_file",
+            {"path": path, "start_line": read_start, "max_lines": 60},
+        )
+        self.console.task_done(1, read_result)
+        if self._tool_result_failed(read_result):
+            return "Impossible de lire le fichier mentionne dans le traceback."
+
+        self.console.task_start(2, len(tasks), tasks[1])
+        patch_result = self._run_direct_tool(
+            "patch_python_unboundlocal",
+            {
+                "path": path,
+                "function_name": function_name,
+                "variable_name": variable_name,
+            },
+        )
+        self.console.task_done(2, patch_result)
+        if self._tool_result_failed(patch_result):
+            return "La correction automatique UnboundLocalError a echoue."
+
+        self.console.task_start(3, len(tasks), tasks[2])
+        verify_read_result = self._run_direct_tool(
+            "read_file",
+            {"path": path, "start_line": max(line_number - 30, 1), "max_lines": 50},
+        )
+        self.console.task_done(3, verify_read_result)
+
+        self.console.task_start(4, len(tasks), tasks[3])
+        compile_result = self._run_direct_tool(
+            "run_command",
+            {"command": f'python -m py_compile "{path}"', "timeout_seconds": 30},
+        )
+        self.console.task_done(4, compile_result)
+
+        if self._tool_result_failed(compile_result):
+            return (
+                "La declaration global a ete ajoutee, mais la verification syntaxique "
+                "a echoue. Consulte la sortie de l'outil ci-dessus."
+            )
+
+        return (
+            f"J'ai corrige `{path}` pour l'erreur UnboundLocalError sur "
+            f"`{variable_name}` dans `{function_name}`. Le patch a ajoute ou mis a jour "
+            "la declaration `global` au debut de la fonction, puis "
+            "`python -m py_compile` a valide la syntaxe.\n\n"
+            "Pour un jeu Pygame, je ne lance pas le programme complet en verification "
+            "automatique, car la fenetre peut rester ouverte et bloquer le CLI."
+        )
+
+    def _run_direct_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute un outil depuis une recette deterministe."""
+
+        self.console.tool_call(name, arguments)
+        result = self.tools.execute(name, arguments)
+        if self.config.verbose or self._tool_result_failed(result):
+            self.console.tool_result(result)
+        return result
 
     def _build_plan(self, user_prompt: str) -> list[str]:
         """Demande au modele un plan court, puis le parse simplement."""
 
         if self._is_simple_answer_request(user_prompt):
             return [user_prompt]
+
+        if "unboundlocalerror" in user_prompt.lower():
+            return [
+                "Lire le fichier Python mentionne dans le traceback autour de la ligne en erreur.",
+                "Appliquer la correction UnboundLocalError avec patch_python_unboundlocal si le fichier, la fonction et la variable sont connus.",
+                "Relire le debut de la fonction modifiee pour verifier que la declaration global a ete ajoutee correctement.",
+                "Verifier la correction avec une commande adaptee sans pretendre au succes si la commande echoue.",
+            ]
 
         plan_prompt = (
             "Construis un plan d'execution pour un coding agent CLI.\n"
@@ -191,7 +346,9 @@ class ChaffoAgent:
 
         read_markers = (
             "lire",
+            "relire",
             "inspecter",
+            "examiner",
             "analyser",
             "comprendre",
             "identifier",
@@ -202,8 +359,15 @@ class ChaffoAgent:
         write_markers = (
             "modifier",
             "corriger",
+            "correction",
+            "appliquer",
             "ajouter",
             "initialiser",
+            "initialise",
+            "assigner",
+            "assigne",
+            "definir",
+            "defini",
             "remplacer",
             "supprimer",
             "ecrire",
@@ -215,17 +379,65 @@ class ChaffoAgent:
             "tester",
             "verifier",
             "confirmer",
+            "s execute",
+            "s executer",
         )
 
         required: list[str] = []
         if any(marker in lowered for marker in read_markers):
             required.extend(["read_file", "list_files"])
         if any(marker in lowered for marker in write_markers):
-            required.extend(["replace_lines", "replace_in_file", "write_file"])
+            required.extend(
+                [
+                    "patch_python_unboundlocal",
+                    "insert_lines",
+                    "replace_lines",
+                    "replace_in_file",
+                    "write_file",
+                ]
+            )
         if any(marker in lowered for marker in run_markers):
             required.append("run_command")
 
         return list(dict.fromkeys(required))
+
+    def _allowed_tools_for_task(self, task: str) -> list[str]:
+        """Limite les outils disponibles selon la tache."""
+
+        required = self._required_tools_for_task(task)
+        if not required:
+            return ["list_files", "read_file"]
+
+        allowed: list[str] = []
+        if any(tool in required for tool in ("read_file", "list_files")):
+            allowed.extend(["list_files", "read_file"])
+
+        if any(
+            tool in required
+            for tool in (
+                "patch_python_unboundlocal",
+                "insert_lines",
+                "replace_lines",
+                "replace_in_file",
+                "write_file",
+            )
+        ):
+            allowed.extend(
+                [
+                    "list_files",
+                    "read_file",
+                    "insert_lines",
+                    "replace_lines",
+                    "replace_in_file",
+                    "write_file",
+                    "patch_python_unboundlocal",
+                ]
+            )
+
+        if "run_command" in required:
+            allowed.extend(["run_command"])
+
+        return list(dict.fromkeys(allowed))
 
     def _normalize_text(self, value: str) -> str:
         """Minuscule + suppression des accents pour matcher simplement."""
@@ -237,10 +449,12 @@ class ChaffoAgent:
         self,
         task_prompt: str,
         required_tools: list[str] | None = None,
+        allowed_tools: list[str] | None = None,
     ) -> str:
         """Execute une tache avec la boucle modele -> outils -> modele."""
 
         required_tools = required_tools or []
+        allowed_tools = allowed_tools or None
         self.messages.append({"role": "user", "content": task_prompt})
         last_tool_result = ""
         failure_reminder_sent = False
@@ -254,7 +468,7 @@ class ChaffoAgent:
             response = self.client.chat(
                 model=self.config.model,
                 messages=self.messages,
-                tools=self.tools.schemas(),
+                tools=self.tools.schemas(allowed_tools),
             )
 
             assistant_message = response.get("message", {})
@@ -316,7 +530,13 @@ class ChaffoAgent:
                 used_tools.append(tool_name)
                 self.console.tool_call(tool_name, arguments)
 
-                result = self.tools.execute(tool_name, arguments)
+                if allowed_tools and tool_name not in allowed_tools:
+                    result = (
+                        f"Erreur: outil `{tool_name}` non autorise pour cette tache. "
+                        f"Outils autorises: {', '.join(allowed_tools)}."
+                    )
+                else:
+                    result = self.tools.execute(tool_name, arguments)
                 last_tool_result = result
                 failure_reminder_sent = False
 
@@ -355,6 +575,7 @@ class ChaffoAgent:
             "texte a remplacer introuvable",
             "action annulee",
             "commande bloquee",
+            "non autorise",
         )
         if any(marker in lowered for marker in failure_markers):
             return True

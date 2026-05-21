@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import fnmatch
 import json
 import shlex
@@ -35,6 +36,7 @@ class ToolRegistry:
     - ecrire un fichier ;
     - remplacer du texte dans un fichier ;
     - remplacer une plage de lignes dans un fichier ;
+    - corriger certains UnboundLocalError Python simples ;
     - lancer une commande.
 
     Chaque chemin est limite au workspace choisi par l'utilisateur. Les actions
@@ -65,10 +67,14 @@ class ToolRegistry:
 
         self.workspace = workspace.resolve()
 
-    def schemas(self) -> list[dict[str, Any]]:
+    def schemas(self, names: list[str] | None = None) -> list[dict[str, Any]]:
         """Schemas envoyes a Ollama dans le champ `tools`."""
 
-        return [tool.schema for tool in self.tools.values()]
+        if names is None:
+            return [tool.schema for tool in self.tools.values()]
+
+        wanted = set(names)
+        return [tool.schema for name, tool in self.tools.items() if name in wanted]
 
     def execute(self, name: str, arguments: Any) -> str:
         """Execute l'outil demande par le modele."""
@@ -132,6 +138,7 @@ class ToolRegistry:
         path: str,
         start_line: int = 1,
         max_lines: int = 200,
+        end_line: int | None = None,
     ) -> str:
         """Lit une portion de fichier avec des numeros de ligne."""
 
@@ -144,16 +151,57 @@ class ToolRegistry:
         text = file_path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         start = max(start_line, 1)
-        end = min(start + max_lines - 1, len(lines))
+        if end_line is not None:
+            end = min(end_line, len(lines))
+        else:
+            end = min(start + max_lines - 1, len(lines))
 
         if start > len(lines):
             return f"Le fichier a seulement {len(lines)} lignes."
+        if end < start:
+            return "Erreur: end_line doit etre superieur ou egal a start_line."
 
         numbered = [
             f"{line_number:4}: {lines[line_number - 1]}"
             for line_number in range(start, end + 1)
         ]
         return "\n".join(numbered)
+
+    def insert_lines(self, path: str, after_line: int, content: str) -> str:
+        """Insere du contenu apres une ligne donnee."""
+
+        file_path = self._safe_path(path)
+        if not file_path.exists() or not file_path.is_file():
+            return f"Fichier introuvable: {path}"
+
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        had_final_newline = text.endswith("\n")
+        lines = text.splitlines()
+
+        if after_line < 0 or after_line > len(lines):
+            return f"Erreur: after_line doit etre entre 0 et {len(lines)}."
+
+        action = f"inserer du contenu apres la ligne {after_line} dans {self._relative(file_path)}"
+        if not self._confirm(action, scope="files:write"):
+            return "Action annulee par l'utilisateur."
+
+        insertion = content.splitlines()
+        new_lines = lines[:after_line] + insertion + lines[after_line:]
+        output = "\n".join(new_lines)
+        if had_final_newline:
+            output += "\n"
+        file_path.write_text(output, encoding="utf-8")
+
+        preview_start = max(after_line - 3, 1)
+        preview_lines = self.read_file(
+            path,
+            start_line=preview_start,
+            max_lines=len(insertion) + 8,
+        )
+        return (
+            f"Contenu insere dans {self._relative(file_path)} apres la ligne {after_line}.\n"
+            f"Apercu:\n{preview_lines}"
+        )
 
     def write_file(self, path: str, content: str) -> str:
         """Cree ou remplace un fichier apres confirmation."""
@@ -243,6 +291,91 @@ class ToolRegistry:
             f"Apercu:\n{preview_lines}"
         )
 
+    def patch_python_unboundlocal(
+        self,
+        path: str,
+        function_name: str,
+        variable_name: str,
+    ) -> str:
+        """Corrige un UnboundLocalError courant avec une declaration global.
+
+        Cas vise :
+        - une variable est definie au niveau module ;
+        - elle est modifiee dans une fonction avec `=`, `+=`, `*=`, etc. ;
+        - Python la considere alors locale et leve UnboundLocalError avant la
+          premiere affectation.
+
+        L'outil ajoute ou complete une ligne `global ...` au debut de la
+        fonction. Il inclut aussi les autres variables globales modifiees dans
+        la meme fonction.
+        """
+
+        file_path = self._safe_path(path)
+        if not file_path.exists() or not file_path.is_file():
+            return f"Fichier introuvable: {path}"
+
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            return f"Erreur: impossible de parser le fichier Python: {exc}"
+
+        function = self._find_function(tree, function_name)
+        if function is None:
+            return f"Erreur: fonction introuvable: {function_name}"
+
+        module_names = self._module_assigned_names(tree)
+        function_names = self._function_assigned_names(function)
+        global_names = sorted((module_names & function_names) | {variable_name})
+
+        if not global_names:
+            return "Erreur: aucune variable globale candidate trouvee."
+
+        lines = text.splitlines()
+        existing_global = self._first_global_statement(function)
+        global_line = " " * (function.col_offset + 4) + "global " + ", ".join(global_names)
+
+        if existing_global is not None:
+            old_line_number = existing_global.lineno
+            old_line = lines[old_line_number - 1].strip()
+            existing_names = set(existing_global.names)
+            merged_names = sorted(existing_names | set(global_names))
+            global_line = " " * (function.col_offset + 4) + "global " + ", ".join(merged_names)
+            action = (
+                f"mettre a jour `{old_line}` en `{global_line.strip()}` "
+                f"dans {self._relative(file_path)}"
+            )
+            if not self._confirm(action, scope="files:write"):
+                return "Action annulee par l'utilisateur."
+            lines[old_line_number - 1] = global_line
+            changed_line = old_line_number
+        else:
+            insert_after = self._global_insert_after_line(function)
+            action = (
+                f"ajouter `{global_line.strip()}` apres la ligne {insert_after} "
+                f"dans {self._relative(file_path)}"
+            )
+            if not self._confirm(action, scope="files:write"):
+                return "Action annulee par l'utilisateur."
+            lines.insert(insert_after, global_line)
+            changed_line = insert_after + 1
+
+        output = "\n".join(lines)
+        if text.endswith("\n"):
+            output += "\n"
+        file_path.write_text(output, encoding="utf-8")
+
+        preview = self.read_file(
+            path,
+            start_line=max(changed_line - 4, 1),
+            max_lines=10,
+        )
+        return (
+            f"Patch UnboundLocalError applique dans {self._relative(file_path)}.\n"
+            f"Variables globales declarees: {', '.join(global_names)}\n"
+            f"Apercu:\n{preview}"
+        )
+
     def run_command(self, command: str, timeout_seconds: int = 30) -> str:
         """Lance une commande dans le workspace apres confirmation."""
 
@@ -315,6 +448,10 @@ class ToolRegistry:
                                 "path": {"type": "string", "description": "Chemin du fichier."},
                                 "start_line": {"type": "integer", "description": "Premiere ligne a lire."},
                                 "max_lines": {"type": "integer", "description": "Nombre maximum de lignes."},
+                                "end_line": {
+                                    "type": "integer",
+                                    "description": "Derniere ligne a lire, optionnelle.",
+                                },
                             },
                         },
                     },
@@ -338,6 +475,31 @@ class ToolRegistry:
                     },
                 },
                 handler=self.write_file,
+            ),
+            "insert_lines": Tool(
+                schema={
+                    "type": "function",
+                    "function": {
+                        "name": "insert_lines",
+                        "description": "Insere du contenu apres une ligne donnee dans un fichier.",
+                        "parameters": {
+                            "type": "object",
+                            "required": ["path", "after_line", "content"],
+                            "properties": {
+                                "path": {"type": "string", "description": "Chemin du fichier."},
+                                "after_line": {
+                                    "type": "integer",
+                                    "description": "Ligne apres laquelle inserer. Utilise 0 pour le debut du fichier.",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Contenu a inserer, sans numeros de lignes.",
+                                },
+                            },
+                        },
+                    },
+                },
+                handler=self.insert_lines,
             ),
             "replace_in_file": Tool(
                 schema={
@@ -396,6 +558,34 @@ class ToolRegistry:
                     },
                 },
                 handler=self.replace_lines,
+            ),
+            "patch_python_unboundlocal": Tool(
+                schema={
+                    "type": "function",
+                    "function": {
+                        "name": "patch_python_unboundlocal",
+                        "description": (
+                            "Corrige un UnboundLocalError Python courant en ajoutant "
+                            "une declaration global dans la fonction concernee."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "required": ["path", "function_name", "variable_name"],
+                            "properties": {
+                                "path": {"type": "string", "description": "Chemin du fichier Python."},
+                                "function_name": {
+                                    "type": "string",
+                                    "description": "Nom de la fonction du traceback, par exemple main.",
+                                },
+                                "variable_name": {
+                                    "type": "string",
+                                    "description": "Nom de la variable du UnboundLocalError.",
+                                },
+                            },
+                        },
+                    },
+                },
+                handler=self.patch_python_unboundlocal,
             ),
             "run_command": Tool(
                 schema={
@@ -502,3 +692,63 @@ class ToolRegistry:
         if len(value) <= MAX_TOOL_OUTPUT_CHARS:
             return value
         return value[:MAX_TOOL_OUTPUT_CHARS] + "\n... sortie tronquee ..."
+
+    def _find_function(self, tree: ast.AST, function_name: str) -> ast.FunctionDef | None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == function_name:
+                return node
+        return None
+
+    def _module_assigned_names(self, tree: ast.Module) -> set[str]:
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                names.update(self._assigned_names_from_node(node))
+        return names
+
+    def _function_assigned_names(self, function: ast.FunctionDef) -> set[str]:
+        names: set[str] = set()
+        for node in ast.walk(function):
+            if node is function:
+                continue
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                names.update(self._assigned_names_from_node(node))
+        return names
+
+    def _assigned_names_from_node(self, node: ast.AST) -> set[str]:
+        names: set[str] = set()
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                names.update(self._assigned_names_from_target(target))
+        elif isinstance(node, ast.AnnAssign):
+            names.update(self._assigned_names_from_target(node.target))
+        elif isinstance(node, ast.AugAssign):
+            names.update(self._assigned_names_from_target(node.target))
+        return names
+
+    def _assigned_names_from_target(self, target: ast.AST) -> set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            names: set[str] = set()
+            for item in target.elts:
+                names.update(self._assigned_names_from_target(item))
+            return names
+        return set()
+
+    def _first_global_statement(self, function: ast.FunctionDef) -> ast.Global | None:
+        for node in function.body:
+            if isinstance(node, ast.Global):
+                return node
+        return None
+
+    def _global_insert_after_line(self, function: ast.FunctionDef) -> int:
+        if (
+            function.body
+            and isinstance(function.body[0], ast.Expr)
+            and isinstance(function.body[0].value, ast.Constant)
+            and isinstance(function.body[0].value.value, str)
+        ):
+            return function.body[0].end_lineno or function.body[0].lineno
+
+        return function.lineno

@@ -115,6 +115,17 @@ C:\...\chaffo-code\workspaces\pong\pong.py
 Chaffo code detecte automatiquement le workspace `pong` et utilise les chemins relatifs a ce dossier.
 Il extrait aussi les fichiers et lignes du traceback pour guider l'agent vers le bon `read_file`.
 
+Pour certains tracebacks Python tres courants, le harness peut appliquer une recette plus deterministe.
+Par exemple, sur un `UnboundLocalError`, Chaffo code extrait le fichier, la fonction et la variable en erreur,
+lit le code, applique `patch_python_unboundlocal`, puis verifie avec :
+
+```powershell
+python -m py_compile "pong.py"
+```
+
+Le programme complet n'est pas lance automatiquement pour un jeu ou une application graphique, car la fenetre
+peut rester ouverte et bloquer le CLI.
+
 ## Utilisation en une commande
 
 ```powershell
@@ -325,14 +336,16 @@ Cette approche suit le pattern "coding agent / harness" : le harness controle la
 | `list_files` | Liste les fichiers du workspace. |
 | `read_file` | Lit un fichier avec numeros de ligne. |
 | `write_file` | Cree ou remplace un fichier. |
+| `insert_lines` | Insere du contenu apres une ligne precise. |
 | `replace_in_file` | Remplace un texte exact dans un fichier. |
 | `replace_lines` | Remplace une plage de lignes, plus fiable pour corriger du code. |
+| `patch_python_unboundlocal` | Corrige certains `UnboundLocalError` Python avec une declaration `global`. |
 | `run_command` | Lance une commande dans le workspace. |
 
 Pour eviter les faux succes, le harness impose certains outils selon la tache :
 
 - une tache de lecture doit appeler `read_file` ou `list_files` ;
-- une tache de modification doit appeler `replace_lines`, `replace_in_file` ou `write_file` ;
+- une tache de modification doit appeler `insert_lines`, `replace_lines`, `replace_in_file`, `write_file` ou un patch specialise ;
 - une tache de test ou execution doit appeler `run_command`.
 
 ## Securite

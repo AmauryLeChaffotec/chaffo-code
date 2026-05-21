@@ -434,6 +434,22 @@ def apply_prompt_workspace_context(
                 f"start_line={start_line}, max_lines=60).\n"
             )
 
+    unboundlocal_hint = extract_unboundlocal_hint(prompt, detected_workspace)
+    if unboundlocal_hint:
+        relative_path, line_number, function_name, variable_name = unboundlocal_hint
+        note += (
+            "- Diagnostic UnboundLocalError detecte:\n"
+            f"  - Variable: {variable_name}\n"
+            f"  - Fonction: {function_name}\n"
+            f"  - Fichier: {relative_path}, ligne {line_number}\n"
+            "  - Cause probable: la variable est definie au niveau module mais "
+            "assignee dans la fonction, donc Python la considere locale.\n"
+            "  - Correction recommandee: utiliser "
+            f"patch_python_unboundlocal(path='{relative_path}', "
+            f"function_name='{function_name}', variable_name='{variable_name}').\n"
+            "  - Ne remplace pas la ligne qui utilise la variable par la meme ligne.\n"
+        )
+
     agent.add_system_note(f"Note du harness:\n{note}")
     return prompt
 
@@ -458,6 +474,35 @@ def extract_traceback_locations(prompt: str, workspace: Path) -> list[tuple[str,
         locations.append((str(relative), line_number))
 
     return locations
+
+
+def extract_unboundlocal_hint(prompt: str, workspace: Path) -> tuple[str, int, str, str] | None:
+    """Extrait le fichier/fonction/variable d'un UnboundLocalError."""
+
+    variable_match = re.search(
+        r"UnboundLocalError: cannot access local variable '([^']+)'",
+        prompt,
+    )
+    if not variable_match:
+        return None
+
+    variable_name = variable_match.group(1)
+    frame_pattern = re.compile(r'File "([^"]+)", line (\d+), in ([A-Za-z_][A-Za-z0-9_]*)')
+    frames = list(frame_pattern.finditer(prompt))
+    if not frames:
+        return None
+
+    last_frame = frames[-1]
+    raw_path = last_frame.group(1)
+    line_number = int(last_frame.group(2))
+    function_name = last_frame.group(3)
+
+    try:
+        relative = Path(raw_path).resolve().relative_to(workspace.resolve())
+    except (OSError, ValueError):
+        return None
+
+    return str(relative), line_number, function_name, variable_name
 
 
 def detect_workspace_from_prompt(prompt: str) -> Path | None:
