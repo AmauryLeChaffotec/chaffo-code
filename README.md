@@ -2,6 +2,8 @@
 
 Chaffo code est un petit coding agent en CLI. Il utilise un modele local via Ollama, par defaut `gemma4:e2b`, et peut lire/modifier des fichiers ou lancer des commandes dans un workspace.
 
+Par securite, l'agent ne travaille pas dans le dossier du projet Chaffo code. Par defaut, toutes ses actions se font dans `workspaces/`.
+
 Le projet est volontairement simple pour rester modifiable par un junior :
 
 - pas de dependance Python externe ;
@@ -60,7 +62,7 @@ chaffo-code --models
 ## Utilisation interactive
 
 ```powershell
-chaffo-code --workspace .
+chaffo-code
 ```
 
 Puis :
@@ -71,10 +73,63 @@ chaffo> ajoute un README pour ce projet
 chaffo> lance les tests
 ```
 
+Le workspace utilise sera :
+
+```text
+workspaces/
+```
+
+Pour travailler dans un sous-dossier separe :
+
+```powershell
+chaffo-code --workspace demo
+```
+
+Dans ce cas, l'agent travaillera dans :
+
+```text
+workspaces/demo/
+```
+
 ## Utilisation en une commande
 
 ```powershell
-chaffo-code "explique la structure du projet" --workspace .
+chaffo-code "explique les fichiers du workspace"
+```
+
+## Longs contenus
+
+Si ton terminal gere mal le collage d'un long texte, utilise un fichier.
+
+Depuis la ligne de commande :
+
+```powershell
+chaffo-code "resume ce contenu" --prompt-file C:\Users\Amaury\Downloads\transcription.txt
+```
+
+Tu peux passer plusieurs fichiers :
+
+```powershell
+chaffo-code "compare ces contenus" --prompt-file note1.txt --prompt-file note2.txt
+```
+
+Tu peux aussi passer du contenu via stdin :
+
+```powershell
+Get-Content .\long-contenu.txt | chaffo-code "resume ce texte" --stdin
+```
+
+Dans le mode interactif, deux commandes existent :
+
+```text
+chaffo> /paste
+Colle ton contenu. Termine avec une ligne qui contient seulement `///`.
+```
+
+ou :
+
+```text
+chaffo> /file C:\Users\Amaury\Downloads\transcription.txt resume ce fichier
 ```
 
 ## Plans automatiques
@@ -120,7 +175,7 @@ chaffo-code --permission-mode ask
 Pour autoriser automatiquement les ecritures et commandes, utile dans un dossier de test :
 
 ```powershell
-chaffo-code "cree un script hello.py" --workspace . --yes
+chaffo-code "cree un script hello.py" --yes
 ```
 
 `--yes` est equivalent a `--permission-mode auto`.
@@ -129,7 +184,7 @@ chaffo-code "cree un script hello.py" --workspace . --yes
 
 Le CLI utilise des couleurs ANSI et un affichage plus proche d'un coding agent moderne :
 
-- bannier d'accueil ;
+- banniere d'accueil ;
 - plan visible ;
 - progression par tache ;
 - affichage des outils appeles ;
@@ -166,6 +221,18 @@ chaffo_code/
     ui.py             Affichage CLI et couleurs
 ```
 
+## Workspaces
+
+Chaffo code force les actions de l'agent dans le dossier `workspaces/`.
+
+| Option | Dossier reel utilise |
+| --- | --- |
+| aucune option | `workspaces/` |
+| `--workspace .` | `workspaces/` |
+| `--workspace demo` | `workspaces/demo/` |
+
+Le dossier est cree automatiquement s'il n'existe pas.
+
 ## Comment fonctionne la boucle agentique
 
 1. Le CLI recoit une demande utilisateur.
@@ -197,6 +264,7 @@ Chaffo code est un projet pedagogique, pas un sandbox parfait.
 Les protections incluses :
 
 - l'agent ne peut agir que dans le workspace choisi ;
+- le workspace reste par defaut dans `workspaces/`, pas dans le code source du projet ;
 - les ecritures et commandes demandent une autorisation de session par defaut ;
 - quelques commandes dangereuses sont bloquees ;
 - les sorties d'outils trop longues sont tronquees.

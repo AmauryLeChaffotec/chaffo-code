@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -8,7 +8,7 @@ class AgentConfig:
 
     model: str = "gemma4:e2b"
     base_url: str = "http://localhost:11434/api"
-    workspace: Path = Path.cwd()
+    workspace: Path = field(default_factory=lambda: Path("workspaces").resolve())
     max_steps: int = 8
     auto_approve: bool = False
     permission_mode: str = "session"

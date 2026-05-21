@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from .ui import Console
 
 def main() -> None:
     args = parse_args()
-    workspace = Path(args.workspace).resolve()
+    workspace = resolve_workspace(args.workspace)
 
     config = AgentConfig(
         model=args.model,
@@ -51,7 +52,7 @@ def main() -> None:
     )
     agent = ChaffoAgent(config=config, client=client, tools=tools, console=console)
 
-    prompt = " ".join(args.prompt).strip()
+    prompt = build_prompt(args)
     if prompt:
         answer = agent.ask(prompt)
         console.final_answer(answer)
@@ -79,7 +80,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--workspace",
         default=".",
-        help="Dossier dans lequel l'agent peut lire et modifier les fichiers.",
+        help="Sous-dossier de workspaces/ dans lequel l'agent travaille. Defaut: workspaces/.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        action="append",
+        default=[],
+        help="Ajoute le contenu d'un fichier a la demande. Peut etre utilise plusieurs fois.",
+    )
+    parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Lit aussi le contenu envoye via stdin.",
     )
     parser.add_argument(
         "--max-steps",
@@ -121,6 +133,57 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_workspace(workspace: str) -> Path:
+    """Retourne un workspace force dans le dossier workspaces/.
+
+    Le but est d'eviter que l'agent modifie le code de Chaffo code par erreur.
+    `--workspace demo` pointe donc vers `workspaces/demo`.
+    `--workspace .` pointe vers `workspaces/`.
+    """
+
+    root = Path("workspaces").resolve()
+    requested = Path(workspace)
+    candidate = requested.resolve() if requested.is_absolute() else (root / requested).resolve()
+
+    if candidate != root and root not in candidate.parents:
+        print("Erreur: le workspace doit rester dans le dossier workspaces/.", file=sys.stderr)
+        raise SystemExit(2)
+
+    candidate.mkdir(parents=True, exist_ok=True)
+    return candidate
+
+
+def build_prompt(args: argparse.Namespace) -> str:
+    """Construit la demande depuis les arguments, stdin et fichiers."""
+
+    parts: list[str] = []
+    inline_prompt = " ".join(args.prompt).strip()
+    if inline_prompt:
+        parts.append(inline_prompt)
+
+    if args.stdin:
+        stdin_content = sys.stdin.read().strip()
+        if stdin_content:
+            parts.append(format_large_content("stdin", stdin_content))
+
+    for prompt_file in args.prompt_file:
+        path = Path(prompt_file).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            print(f"Erreur: fichier introuvable pour --prompt-file: {path}", file=sys.stderr)
+            raise SystemExit(2)
+
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+        parts.append(format_large_content(str(path), content))
+
+    return "\n\n".join(parts).strip()
+
+
+def format_large_content(source: str, content: str) -> str:
+    """Encadre un long contenu pour que le modele comprenne sa provenance."""
+
+    return f"Contenu fourni depuis {source}:\n\n```text\n{content}\n```"
+
+
 def print_models(client: OllamaClient) -> None:
     models = client.list_models()
     if not models:
@@ -134,7 +197,9 @@ def print_models(client: OllamaClient) -> None:
 
 def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
     console.banner(config.model, config.workspace)
-    print("Tape `exit` ou `quit` pour quitter.\n")
+    print("Tape `exit` ou `quit` pour quitter.")
+    print("Tape `/paste` pour coller plusieurs lignes, fin avec une ligne `///`.")
+    print("Tape `/file chemin question optionnelle` pour envoyer un fichier long.\n")
 
     while True:
         try:
@@ -145,8 +210,60 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
 
         if prompt.lower() in {"exit", "quit"}:
             return
+        if prompt == "/paste":
+            prompt = read_multiline_prompt()
+        elif prompt.startswith("/file "):
+            prompt = read_file_command(prompt)
         if not prompt:
             continue
 
         answer = agent.ask(prompt)
         console.final_answer(answer)
+
+
+def read_multiline_prompt() -> str:
+    """Lit un long prompt multi-ligne dans le REPL."""
+
+    print("Colle ton contenu. Termine avec une ligne qui contient seulement `///`.")
+    lines: list[str] = []
+
+    while True:
+        try:
+            line = input()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if line.strip() == "///":
+            break
+
+        lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
+def read_file_command(command: str) -> str:
+    """Lit un fichier depuis le REPL et l'ajoute au prompt."""
+
+    try:
+        parts = shlex.split(command, posix=False)
+    except ValueError as exc:
+        print(f"Commande /file invalide: {exc}")
+        return ""
+
+    if len(parts) < 2:
+        print("Usage: /file chemin [question optionnelle]")
+        return ""
+
+    path = Path(parts[1].strip("\"'")).expanduser().resolve()
+    question = " ".join(parts[2:]).strip()
+
+    if not path.exists() or not path.is_file():
+        print(f"Fichier introuvable: {path}")
+        return ""
+
+    content = path.read_text(encoding="utf-8", errors="replace").strip()
+    if question:
+        return f"{question}\n\n{format_large_content(str(path), content)}"
+
+    return format_large_content(str(path), content)

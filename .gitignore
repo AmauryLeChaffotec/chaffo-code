@@ -8,4 +8,5 @@ venv/
 dist/
 build/
 workspace/
+workspaces/
 *.log
