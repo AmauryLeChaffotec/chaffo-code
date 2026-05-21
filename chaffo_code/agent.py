@@ -53,6 +53,7 @@ class ChaffoAgent:
     def ask(self, user_prompt: str) -> str:
         """Traite une demande utilisateur et retourne la reponse finale."""
 
+        self.console.user_prompt(user_prompt)
         tasks = self._build_plan(user_prompt)
         self.console.plan(tasks)
 
@@ -84,6 +85,9 @@ class ChaffoAgent:
     def _build_plan(self, user_prompt: str) -> list[str]:
         """Demande au modele un plan court, puis le parse simplement."""
 
+        if self._is_simple_answer_request(user_prompt):
+            return [user_prompt]
+
         plan_prompt = (
             "Construis un plan d'execution pour un coding agent CLI.\n"
             "Retourne uniquement une liste numerotee de 1 a 5 taches courtes.\n"
@@ -107,6 +111,31 @@ class ChaffoAgent:
         content = str(response.get("message", {}).get("content", "")).strip()
         tasks = self._parse_plan(content)
         return tasks or [user_prompt]
+
+    def _is_simple_answer_request(self, user_prompt: str) -> bool:
+        """Evite un gros plan agentique pour une simple reponse texte."""
+
+        prompt = user_prompt.strip().lower()
+        simple_starts = ("reponds", "repond ", "dis ", "dit ", "ecris juste")
+        coding_markers = (
+            ".py",
+            "traceback",
+            "erreur",
+            "exception",
+            "corrige",
+            "modifie",
+            "cree",
+            "ajoute",
+            "supprime",
+            "fichier",
+            "lance",
+            "execute",
+            "test",
+        )
+
+        return prompt.startswith(simple_starts) and not any(
+            marker in prompt for marker in coding_markers
+        )
 
     def _parse_plan(self, content: str) -> list[str]:
         """Parse une liste numerotee sans chercher a etre trop malin."""
@@ -210,6 +239,18 @@ class ChaffoAgent:
             tools=[],
         )
         return str(response.get("message", {}).get("content", "")).strip()
+
+    def set_workspace(self, workspace: Any) -> None:
+        """Change le workspace de l'agent et garde une trace dans le contexte."""
+
+        self.config.workspace = workspace
+        self.tools.set_workspace(workspace)
+        self.messages.append(
+            {
+                "role": "system",
+                "content": f"Le workspace actif est maintenant: {workspace}",
+            }
+        )
 
     def _parse_tool_call(self, call: dict[str, Any]) -> tuple[str, Any]:
         """Extrait le nom et les arguments d'un tool call Ollama."""

@@ -54,6 +54,16 @@ class ToolRegistry:
         self.console = console or Console()
         self.tools = self._build_tools()
 
+    def set_workspace(self, workspace: Path) -> None:
+        """Change le workspace utilise par les outils.
+
+        Le CLI verifie deja que le chemin reste dans `workspaces/`.
+        Cette methode permet simplement au REPL de changer de projet sans
+        relancer Chaffo code.
+        """
+
+        self.workspace = workspace.resolve()
+
     def schemas(self) -> list[dict[str, Any]]:
         """Schemas envoyes a Ollama dans le champ `tools`."""
 
@@ -344,6 +354,8 @@ class ToolRegistry:
         accepted = answer in {"y", "yes", "o", "oui", "s", "session"}
 
         if not accepted:
+            if answer:
+                self.console.warning("Reponse non reconnue, action refusee.")
             return False
 
         if self.permission_mode == "session" or answer in {"s", "session"}:

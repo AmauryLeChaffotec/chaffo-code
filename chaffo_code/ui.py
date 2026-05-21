@@ -50,6 +50,16 @@ class Console:
         for index, task in enumerate(tasks, start=1):
             print(f"  {self.color(str(index) + '.', self.cyan)} {task}")
 
+    def user_prompt(self, prompt: str) -> None:
+        self.section("Demande recue")
+        print(textwrap.indent(self.compact(prompt, width=100, max_lines=10), "  "))
+
+    def info(self, message: str) -> None:
+        print(self.color(f"  {message}", self.cyan))
+
+    def warning(self, message: str) -> None:
+        print(self.color(f"  {message}", self.coral))
+
     def task_start(self, index: int, total: int, task: str) -> None:
         self.section(f"Tache {index}/{total}")
         print(f"  {task}")
@@ -104,4 +114,3 @@ class Console:
             visible.append("...")
 
         return "\n".join(visible)
-

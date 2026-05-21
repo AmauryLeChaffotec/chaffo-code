@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import shlex
 import sys
 from pathlib import Path
@@ -11,6 +12,10 @@ from .config import AgentConfig
 from .ollama_client import OllamaClient, OllamaError
 from .tools import ToolRegistry
 from .ui import Console
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+WORKSPACES_ROOT = PROJECT_ROOT / "workspaces"
 
 
 def main() -> None:
@@ -94,6 +99,11 @@ def parse_args() -> argparse.Namespace:
         help="Lit aussi le contenu envoye via stdin.",
     )
     parser.add_argument(
+        "--clipboard",
+        action="store_true",
+        help="Lit aussi le contenu du presse-papiers.",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=8,
@@ -141,9 +151,19 @@ def resolve_workspace(workspace: str) -> Path:
     `--workspace .` pointe vers `workspaces/`.
     """
 
-    root = Path("workspaces").resolve()
+    root = WORKSPACES_ROOT.resolve()
     requested = Path(workspace)
-    candidate = requested.resolve() if requested.is_absolute() else (root / requested).resolve()
+
+    if workspace == ".":
+        current_directory = Path.cwd().resolve()
+        if current_directory == root or root in current_directory.parents:
+            candidate = current_directory
+        else:
+            candidate = root
+    elif requested.is_absolute():
+        candidate = requested.resolve()
+    else:
+        candidate = (root / requested).resolve()
 
     if candidate != root and root not in candidate.parents:
         print("Erreur: le workspace doit rester dans le dossier workspaces/.", file=sys.stderr)
@@ -166,6 +186,11 @@ def build_prompt(args: argparse.Namespace) -> str:
         if stdin_content:
             parts.append(format_large_content("stdin", stdin_content))
 
+    if args.clipboard:
+        clipboard_content = read_clipboard().strip()
+        if clipboard_content:
+            parts.append(format_large_content("presse-papiers", clipboard_content))
+
     for prompt_file in args.prompt_file:
         path = Path(prompt_file).expanduser().resolve()
         if not path.exists() or not path.is_file():
@@ -184,6 +209,36 @@ def format_large_content(source: str, content: str) -> str:
     return f"Contenu fourni depuis {source}:\n\n```text\n{content}\n```"
 
 
+def read_clipboard() -> str:
+    """Lit le presse-papiers sans dependance externe.
+
+    Tkinter fonctionne souvent avec Python desktop. Le fallback PowerShell est
+    pratique sur Windows si Tkinter n'est pas disponible.
+    """
+
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.withdraw()
+        content = root.clipboard_get()
+        root.destroy()
+        return content
+    except Exception:
+        pass
+
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        return completed.stdout
+
+    return ""
+
+
 def print_models(client: OllamaClient) -> None:
     models = client.list_models()
     if not models:
@@ -199,11 +254,13 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
     console.banner(config.model, config.workspace)
     print("Tape `exit` ou `quit` pour quitter.")
     print("Tape `/paste` pour coller plusieurs lignes, fin avec une ligne `///`.")
-    print("Tape `/file chemin question optionnelle` pour envoyer un fichier long.\n")
+    print("Tape `/clip question optionnelle` pour envoyer le presse-papiers.")
+    print("Tape `/file chemin question optionnelle` pour envoyer un fichier long.")
+    print("Tape `/workspace nom` pour changer de sous-dossier dans workspaces/.\n")
 
     while True:
         try:
-            prompt = input("chaffo> ").strip()
+            prompt = input(f"chaffo:{workspace_label(config.workspace)}> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -212,13 +269,36 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
             return
         if prompt == "/paste":
             prompt = read_multiline_prompt()
+        elif prompt == "/clip" or prompt.startswith("/clip "):
+            prompt = read_clipboard_command(prompt)
         elif prompt.startswith("/file "):
             prompt = read_file_command(prompt)
+        elif prompt == "/workspace" or prompt.startswith("/workspace "):
+            switch_workspace(prompt, agent, config, console)
+            continue
+        elif looks_like_powershell_prompt(prompt):
+            console.warning(
+                "Tu as colle une ligne de terminal PowerShell. "
+                "Pour envoyer toute l'erreur, utilise `/paste` ou `/clip`."
+            )
+            continue
         if not prompt:
             continue
 
         answer = agent.ask(prompt)
         console.final_answer(answer)
+
+
+def workspace_label(workspace: Path) -> str:
+    """Nom court affiche dans le prompt du REPL."""
+
+    try:
+        relative = workspace.resolve().relative_to(WORKSPACES_ROOT.resolve())
+    except ValueError:
+        return "?"
+
+    label = str(relative)
+    return "." if label == "." else label
 
 
 def read_multiline_prompt() -> str:
@@ -240,6 +320,22 @@ def read_multiline_prompt() -> str:
         lines.append(line)
 
     return "\n".join(lines).strip()
+
+
+def read_clipboard_command(command: str) -> str:
+    """Construit un prompt a partir du presse-papiers."""
+
+    question = command.removeprefix("/clip").strip()
+    content = read_clipboard().strip()
+
+    if not content:
+        print("Le presse-papiers est vide ou illisible.")
+        return ""
+
+    if question:
+        return f"{question}\n\n{format_large_content('presse-papiers', content)}"
+
+    return format_large_content("presse-papiers", content)
 
 
 def read_file_command(command: str) -> str:
@@ -267,3 +363,29 @@ def read_file_command(command: str) -> str:
         return f"{question}\n\n{format_large_content(str(path), content)}"
 
     return format_large_content(str(path), content)
+
+
+def switch_workspace(
+    command: str,
+    agent: ChaffoAgent,
+    config: AgentConfig,
+    console: Console,
+) -> None:
+    """Change le workspace courant depuis le REPL."""
+
+    requested = command.removeprefix("/workspace").strip() or "."
+    new_workspace = resolve_workspace(requested)
+    config.workspace = new_workspace
+    agent.set_workspace(new_workspace)
+    console.info(f"Workspace actif: {new_workspace}")
+
+
+def looks_like_powershell_prompt(prompt: str) -> bool:
+    r"""Detecte `PS C:\...\workspaces\pong> python pong.py`.
+
+    Ce format indique souvent que l'utilisateur a colle une sortie de terminal
+    complete sans passer par /paste. Dans ce cas, seule la premiere ligne serait
+    capturee par input(), donc on prefere guider l'utilisateur.
+    """
+
+    return prompt.startswith("PS ") and "> " in prompt

@@ -79,6 +79,21 @@ Le workspace utilise sera :
 workspaces/
 ```
 
+Si tu lances Chaffo code depuis un sous-dossier de `workspaces/`, il utilise automatiquement ce sous-dossier.
+
+Exemple :
+
+```powershell
+cd .\workspaces\pong
+python -m chaffo_code
+```
+
+Le workspace actif sera alors :
+
+```text
+workspaces/pong/
+```
+
 Pour travailler dans un sous-dossier separe :
 
 ```powershell
@@ -119,6 +134,12 @@ Tu peux aussi passer du contenu via stdin :
 Get-Content .\long-contenu.txt | chaffo-code "resume ce texte" --stdin
 ```
 
+Ou directement depuis le presse-papiers :
+
+```powershell
+chaffo-code "corrige cette erreur" --clipboard
+```
+
 Dans le mode interactif, deux commandes existent :
 
 ```text
@@ -131,6 +152,21 @@ ou :
 ```text
 chaffo> /file C:\Users\Amaury\Downloads\transcription.txt resume ce fichier
 ```
+
+Tu peux aussi copier une erreur complete dans ton presse-papiers, puis taper :
+
+```text
+chaffo> /clip corrige cette erreur
+```
+
+Evite de coller directement une sortie PowerShell comme :
+
+```text
+PS C:\...\workspaces\pong> python pong.py
+Traceback ...
+```
+
+Le terminal enverra souvent seulement la premiere ligne a Chaffo code, puis le reste risque d'arriver au mauvais moment. Utilise plutot `/paste` ou `/clip`.
 
 ## Plans automatiques
 
@@ -230,8 +266,21 @@ Chaffo code force les actions de l'agent dans le dossier `workspaces/`.
 | aucune option | `workspaces/` |
 | `--workspace .` | `workspaces/` |
 | `--workspace demo` | `workspaces/demo/` |
+| lancement depuis `workspaces/pong/` | `workspaces/pong/` |
 
 Le dossier est cree automatiquement s'il n'existe pas.
+
+Dans le mode interactif, tu peux changer de workspace :
+
+```text
+chaffo> /workspace pong
+```
+
+Le prompt affiche le workspace actif :
+
+```text
+chaffo:pong>
+```
 
 ## Comment fonctionne la boucle agentique
 
