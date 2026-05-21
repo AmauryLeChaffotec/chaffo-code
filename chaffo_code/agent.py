@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+from typing import Any
+
+from .config import AgentConfig
+from .ollama_client import OllamaClient
+from .tools import ToolRegistry
+from .ui import Console
+
+
+SYSTEM_PROMPT = """Tu es Chaffo code, un coding agent local lance en CLI.
+
+Ta mission:
+- aider l'utilisateur a comprendre, modifier et tester du code dans le workspace;
+- avancer par petites etapes;
+- utiliser les outils quand tu as besoin de lire, modifier ou executer quelque chose;
+- expliquer clairement ce que tu as fait a la fin.
+
+Regles importantes:
+- Lis les fichiers avant de les modifier.
+- Prefere des modifications simples et localisees.
+- N'invente pas le contenu d'un fichier: utilise read_file si tu dois t'appuyer dessus.
+- Les actions d'ecriture et d'execution peuvent demander confirmation a l'utilisateur.
+- Suis le plan fourni par le harness, tache par tache.
+- Si une commande echoue, lis l'erreur et propose ou applique une correction.
+- Quand la tache est terminee, reponds sans appeler d'outil supplementaire.
+"""
+
+
+class ChaffoAgent:
+    """Boucle agentique principale.
+
+    Le modele peut appeler un ou plusieurs outils. Apres chaque appel, on ajoute
+    le resultat au fil de messages, puis on redemande au modele quoi faire.
+    La boucle s'arrete quand le modele repond sans tool call.
+    """
+
+    def __init__(
+        self,
+        config: AgentConfig,
+        client: OllamaClient,
+        tools: ToolRegistry,
+        console: Console | None = None,
+    ) -> None:
+        self.config = config
+        self.client = client
+        self.tools = tools
+        self.console = console or Console()
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+        ]
+
+    def ask(self, user_prompt: str) -> str:
+        """Traite une demande utilisateur et retourne la reponse finale."""
+
+        tasks = self._build_plan(user_prompt)
+        self.console.plan(tasks)
+
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"Demande initiale:\n{user_prompt}\n\n"
+                    "Plan choisi par le harness:\n"
+                    + "\n".join(f"{index}. {task}" for index, task in enumerate(tasks, start=1))
+                ),
+            }
+        )
+
+        task_notes: list[str] = []
+        for index, task in enumerate(tasks, start=1):
+            self.console.task_start(index, len(tasks), task)
+            task_prompt = (
+                f"Execute uniquement la tache {index}/{len(tasks)}:\n{task}\n\n"
+                "Utilise les outils si necessaire. Quand cette tache est terminee, "
+                "donne un court bilan et n'appelle plus d'outil."
+            )
+            note = self._run_tool_loop(task_prompt)
+            task_notes.append(note)
+            self.console.task_done(index, note)
+
+        return self._summarize(user_prompt, tasks, task_notes)
+
+    def _build_plan(self, user_prompt: str) -> list[str]:
+        """Demande au modele un plan court, puis le parse simplement."""
+
+        plan_prompt = (
+            "Construis un plan d'execution pour un coding agent CLI.\n"
+            "Retourne uniquement une liste numerotee de 1 a 5 taches courtes.\n"
+            "Chaque tache doit etre concrete et actionnable.\n\n"
+            "Regles de planification:\n"
+            "- Pour une demande simple, fais une seule tache.\n"
+            "- Pour une modification de code, prevois inspection, modification, verification.\n"
+            "- N'ajoute pas d'inspection, de modification ou de test si la demande ne l'exige pas.\n"
+            "- Ne cree pas de tache vague comme 'finaliser' si elle n'apporte rien.\n\n"
+            f"Demande utilisateur:\n{user_prompt}"
+        )
+
+        response = self.client.chat(
+            model=self.config.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": plan_prompt},
+            ],
+            tools=[],
+        )
+        content = str(response.get("message", {}).get("content", "")).strip()
+        tasks = self._parse_plan(content)
+        return tasks or [user_prompt]
+
+    def _parse_plan(self, content: str) -> list[str]:
+        """Parse une liste numerotee sans chercher a etre trop malin."""
+
+        tasks: list[str] = []
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            cleaned = self._remove_number_prefix(line)
+            if cleaned:
+                tasks.append(cleaned)
+
+        return tasks[:6]
+
+    def _remove_number_prefix(self, line: str) -> str:
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            return ""
+
+        prefix = parts[0].rstrip(".):")
+        if prefix.isdigit():
+            return parts[1].strip()
+
+        if line.startswith("- "):
+            return line[2:].strip()
+
+        return ""
+
+    def _run_tool_loop(self, task_prompt: str) -> str:
+        """Execute une tache avec la boucle modele -> outils -> modele."""
+
+        self.messages.append({"role": "user", "content": task_prompt})
+
+        for step in range(1, self.config.max_steps + 1):
+            if self.config.verbose:
+                self.console.section(f"Boucle outil {step}/{self.config.max_steps}")
+
+            response = self.client.chat(
+                model=self.config.model,
+                messages=self.messages,
+                tools=self.tools.schemas(),
+            )
+
+            assistant_message = response.get("message", {})
+            tool_calls = assistant_message.get("tool_calls") or []
+
+            # On conserve le message assistant pour que le modele garde le fil.
+            self.messages.append(assistant_message)
+
+            if not tool_calls:
+                return str(assistant_message.get("content", "")).strip()
+
+            for call in tool_calls:
+                tool_name, arguments = self._parse_tool_call(call)
+                self.console.tool_call(tool_name, arguments)
+
+                result = self.tools.execute(tool_name, arguments)
+                if self.config.verbose:
+                    self.console.tool_result(result)
+
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_name": tool_name,
+                        "content": result,
+                    }
+                )
+
+        return (
+            "J'ai atteint la limite d'etapes sans terminer. "
+            "Relance avec --max-steps plus grand si necessaire."
+        )
+
+    def _summarize(
+        self,
+        user_prompt: str,
+        tasks: list[str],
+        task_notes: list[str],
+    ) -> str:
+        """Produit une synthese finale concise apres toutes les taches."""
+
+        summary_prompt = (
+            "Resume le travail effectue pour l'utilisateur.\n"
+            "Sois concis: ce qui a ete fait, fichiers touches si tu les connais, "
+            "et prochaine action utile si necessaire.\n\n"
+            f"Demande initiale:\n{user_prompt}\n\n"
+            "Plan:\n"
+            + "\n".join(f"{index}. {task}" for index, task in enumerate(tasks, start=1))
+            + "\n\nBilans de taches:\n"
+            + "\n".join(f"{index}. {note}" for index, note in enumerate(task_notes, start=1))
+        )
+
+        response = self.client.chat(
+            model=self.config.model,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": summary_prompt},
+            ],
+            tools=[],
+        )
+        return str(response.get("message", {}).get("content", "")).strip()
+
+    def _parse_tool_call(self, call: dict[str, Any]) -> tuple[str, Any]:
+        """Extrait le nom et les arguments d'un tool call Ollama."""
+
+        function = call.get("function", {})
+        name = str(function.get("name", ""))
+        arguments = function.get("arguments", {})
+        return name, arguments

@@ -1,0 +1,14 @@
+[project]
+name = "chaffo-code"
+version = "0.1.0"
+description = "Petit coding agent CLI local avec Ollama et Gemma 4."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+chaffo-code = "chaffo_code.cli:main"
+
+[tool.pyright]
+include = ["chaffo_code"]
+
