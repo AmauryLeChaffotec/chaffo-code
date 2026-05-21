@@ -52,7 +52,15 @@ class Console:
 
     def user_prompt(self, prompt: str) -> None:
         self.section("Demande recue")
-        print(textwrap.indent(self.compact(prompt, width=100, max_lines=10), "  "))
+        line_count = len(prompt.splitlines()) or 1
+        char_count = len(prompt)
+        print(f"  {line_count} ligne(s), {char_count} caractere(s) captures")
+
+        compact_prompt = self.compact(prompt, width=100, max_lines=10)
+        print(textwrap.indent(compact_prompt, "  "))
+
+        if compact_prompt != prompt.strip():
+            print(self.color("  affichage abrege, contenu complet envoye au modele", self.muted))
 
     def info(self, message: str) -> None:
         print(self.color(f"  {message}", self.cyan))

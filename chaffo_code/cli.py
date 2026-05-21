@@ -5,6 +5,7 @@ import os
 import subprocess
 import shlex
 import sys
+import time
 from pathlib import Path
 
 from .agent import ChaffoAgent
@@ -260,7 +261,7 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
 
     while True:
         try:
-            prompt = input(f"chaffo:{workspace_label(config.workspace)}> ").strip()
+            prompt = read_repl_input(f"chaffo:{workspace_label(config.workspace)}> ")
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -276,10 +277,11 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
         elif prompt == "/workspace" or prompt.startswith("/workspace "):
             switch_workspace(prompt, agent, config, console)
             continue
-        elif looks_like_powershell_prompt(prompt):
+        elif "\n" not in prompt and looks_like_powershell_prompt(prompt):
             console.warning(
                 "Tu as colle une ligne de terminal PowerShell. "
-                "Pour envoyer toute l'erreur, utilise `/paste` ou `/clip`."
+                "Il manque probablement le reste de l'erreur. "
+                "Colle tout le bloc d'un coup, ou utilise `/paste` ou `/clip`."
             )
             continue
         if not prompt:
@@ -287,6 +289,98 @@ def run_repl(agent: ChaffoAgent, config: AgentConfig, console: Console) -> None:
 
         answer = agent.ask(prompt)
         console.final_answer(answer)
+
+
+def read_repl_input(prompt_label: str) -> str:
+    """Lit une demande REPL et recupere les lignes collees en attente.
+
+    Quand on colle plusieurs lignes dans un terminal, `input()` lit seulement la
+    premiere ligne. Les autres peuvent rester dans le buffer et etre avalees par
+    le prochain prompt, par exemple une autorisation. Cette fonction draine les
+    caracteres deja colles juste apres la premiere ligne.
+    """
+
+    first_line = input(prompt_label)
+    extra_text = collect_pending_paste_text()
+
+    if not extra_text:
+        return first_line.strip()
+
+    return f"{first_line}\n{extra_text}".strip()
+
+
+def collect_pending_paste_text() -> str:
+    """Recupere le texte colle qui attend deja dans le terminal."""
+
+    if not sys.stdin.isatty():
+        return ""
+
+    if os.name == "nt":
+        return collect_pending_windows_text()
+
+    return collect_pending_posix_text()
+
+
+def collect_pending_windows_text() -> str:
+    """Draine le buffer clavier Windows apres un collage multi-ligne."""
+
+    try:
+        import msvcrt
+    except ImportError:
+        return ""
+
+    chars: list[str] = []
+    deadline = time.monotonic() + 0.20
+    max_chars = 200_000
+
+    while time.monotonic() < deadline and len(chars) < max_chars:
+        found_char = False
+
+        while msvcrt.kbhit() and len(chars) < max_chars:
+            char = msvcrt.getwch()
+            found_char = True
+
+            if char in {"\r", "\n"}:
+                chars.append("\n")
+            elif char in {"\x00", "\xe0"}:
+                # Touche speciale Windows: on consomme le code suivant.
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+            else:
+                chars.append(char)
+
+        if found_char:
+            deadline = time.monotonic() + 0.20
+        else:
+            time.sleep(0.02)
+
+    return "".join(chars).strip()
+
+
+def collect_pending_posix_text() -> str:
+    """Draine le buffer stdin sur les terminaux compatibles select()."""
+
+    try:
+        import select
+    except ImportError:
+        return ""
+
+    chunks: list[str] = []
+    deadline = time.monotonic() + 0.20
+    max_chars = 200_000
+
+    while time.monotonic() < deadline and sum(len(chunk) for chunk in chunks) < max_chars:
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+        if readable:
+            chunk = sys.stdin.readline()
+            if not chunk:
+                break
+            chunks.append(chunk)
+            deadline = time.monotonic() + 0.20
+        else:
+            time.sleep(0.02)
+
+    return "".join(chunks).strip()
 
 
 def workspace_label(workspace: Path) -> str:
@@ -381,11 +475,11 @@ def switch_workspace(
 
 
 def looks_like_powershell_prompt(prompt: str) -> bool:
-    r"""Detecte `PS C:\...\workspaces\pong> python pong.py`.
+    r"""Detecte une ligne du style `PS C:\...\workspaces\pong> python pong.py`.
 
     Ce format indique souvent que l'utilisateur a colle une sortie de terminal
     complete sans passer par /paste. Dans ce cas, seule la premiere ligne serait
     capturee par input(), donc on prefere guider l'utilisateur.
     """
 
-    return prompt.startswith("PS ") and "> " in prompt
+    return "PS " in prompt and "> " in prompt

@@ -114,7 +114,18 @@ chaffo-code "explique les fichiers du workspace"
 
 ## Longs contenus
 
-Si ton terminal gere mal le collage d'un long texte, utilise un fichier.
+Dans le mode interactif, Chaffo code essaie de recuperer automatiquement les lignes qui suivent quand tu colles un bloc multi-ligne.
+
+Quand une demande est recue, il affiche :
+
+```text
+> Demande recue
+  12 ligne(s), 1830 caractere(s) captures
+```
+
+Si l'affichage est abrege, le contenu complet est quand meme envoye au modele.
+
+Si ton terminal gere mal le collage d'un long texte, utilise un fichier ou le presse-papiers.
 
 Depuis la ligne de commande :
 
@@ -167,6 +178,8 @@ Traceback ...
 ```
 
 Le terminal enverra souvent seulement la premiere ligne a Chaffo code, puis le reste risque d'arriver au mauvais moment. Utilise plutot `/paste` ou `/clip`.
+
+Si Chaffo detecte une ligne PowerShell seule, il refusera de partir sur cette demande et te demandera de renvoyer le bloc complet.
 
 ## Plans automatiques
 
